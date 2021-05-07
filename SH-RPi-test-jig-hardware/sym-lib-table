@@ -1,0 +1,3 @@
+(sym_lib_table
+  (lib (name SH-RPi-test-jig)(type Legacy)(uri ${KIPRJMOD}/SH-RPi-test-jig.lib)(options "")(descr ""))
+)
