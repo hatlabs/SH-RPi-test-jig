@@ -6,8 +6,8 @@
 #define ESP32_CAN_TX_PIN GPIO_NUM_32
 
 #define DUT_POWER_ON_PIN 14
-#define READY_TO_FLASH_PIN 12
-#define FLASH_OK_PIN 27
+#define READY_TO_FLASH_PIN 27
+#define FLASH_OK_PIN 13
 #define DUT_PRESENT_PIN 15
 
 #define ATT_I2C_ADDR 0x6d
@@ -58,9 +58,12 @@ float wind_speed = 0;
 
 
 enum class StateMachineState {
-  START = 0,
-  wait_for_dut_present,
+  NONE = 0,
+  START,
+  wait_for_dut,
   dut_present,
+  wait_for_flasher,
+  flasher_active,
   wait_flash_ok,
   flash_ok,
   flash_timeout,
@@ -86,11 +89,15 @@ enum class StateMachineState {
 };
 
 StateMachineState state_machine_state = StateMachineState::START;
-StateMachineState prev_state = StateMachineState::START;
+StateMachineState prev_state = StateMachineState::NONE;
 
 void set_sm_state(StateMachineState new_state) {
-  prev_state = state_machine_state;
   state_machine_state = new_state;
+}
+
+void state_NONE() {
+  Serial.println("WARNING: Should never enter NONE state");
+  set_sm_state(StateMachineState::START);
 }
 
 void state_START() {
@@ -101,15 +108,16 @@ void state_START() {
   vcc = -1;
   vin = -1;
   wind_speed = 0;
+  can_tx_enabled = false;
 
-  set_sm_state(StateMachineState::wait_for_dut_present);
+  set_sm_state(StateMachineState::wait_for_dut);
 }
 
 bool dut_present() {
   return !digitalRead(DUT_PRESENT_PIN);
 }
 
-void state_wait_for_dut_present() {
+void state_wait_for_dut() {
   if (dut_present()) {
     set_sm_state(StateMachineState::dut_present);
   }
@@ -120,9 +128,31 @@ const int flash_timeout = 60*1000;  // flashing should be finished in 60 s
 
 void state_dut_present() {
   // inform the flasher that it's OK to start flashing
-  digitalWrite(READY_TO_FLASH_PIN, true);
-  flashing = 0;
-  set_sm_state(StateMachineState::wait_flash_ok);
+  //digitalWrite(READY_TO_FLASH_PIN, true);
+  //flashing = 0;
+  //set_sm_state(StateMachineState::wait_for_flasher);
+  set_sm_state(StateMachineState::flash_ok);
+}
+
+bool flasher_present() {
+  return digitalRead(FLASH_OK_PIN);
+}
+
+void state_wait_for_flasher() {
+  if (flasher_present()) {
+    set_sm_state(StateMachineState::flasher_active);
+  }
+}
+
+bool flasher_active() {
+  // flasher has started flashing if FLASH_OK is low
+  return !digitalRead(FLASH_OK_PIN);
+}
+
+void state_flasher_active() {
+  if (flasher_active()) {
+    set_sm_state(StateMachineState::wait_flash_ok);
+  }
 }
 
 bool flash_ok() {
@@ -141,7 +171,7 @@ void state_wait_flash_ok() {
 
 void state_flash_ok() {
   flashing_successful = true;
-  digitalWrite(FLASH_OK_PIN, false);
+  digitalWrite(READY_TO_FLASH_PIN, false);
   digitalWrite(DUT_POWER_ON_PIN, true);
   set_sm_state(StateMachineState::dut_powered);
 }
@@ -159,11 +189,13 @@ void state_dut_powered() {
 }
 
 float measure_vsup() {
-  return (4.096/32768) * ads1115->readADC_SingleEnded(0);
+  float vsup = (4.096/32768) * ads1115->readADC_SingleEnded(0);
+  return vsup;
 }
 
 void state_measure_vsup() {
-  vsup = measure_vsup();
+  vsup = ((300.+200.)/200.) * measure_vsup();
+  Serial.printf("Vsup: %f\n", vsup);
   if (vsup < 1.5 || vsup > 2.7) {
     // fatal: can't expect vcc to turn on
     set_sm_state(StateMachineState::report_test_result);
@@ -177,11 +209,13 @@ void state_measure_vsup() {
 
 void state_vsup_ok() {
   // TODO: report result
+  set_wait_duration(1000);
   set_sm_state(StateMachineState::measure_vcc);
 }
 
 void state_vsup_fail() {
   // TODO: report result
+  set_wait_duration(1000);
   set_sm_state(StateMachineState::measure_vcc);
 }
 
@@ -193,6 +227,7 @@ float measure_vcc() {
 
 void state_measure_vcc() {
   float vcc = measure_vcc();
+  Serial.printf("Vcc: %f\n", vcc);
   if (vcc < 5 || vcc > 5.2) {
     // vcc out of range
     set_sm_state(StateMachineState::vcc_fail);
@@ -218,15 +253,15 @@ float measure_vin() {
 }
 
 bool read_i2c_byte_register(int addr, int register, uint8_t* value) {
-  Wire.beginTransmission(ATT_I2C_ADDR);
-  Wire.write(0x20);
-  Wire.endTransmission();
+  i2c->beginTransmission(ATT_I2C_ADDR);
+  i2c->write(0x20);
+  i2c->endTransmission();
 
-  Wire.requestFrom(ATT_I2C_ADDR, 1);
+  i2c->requestFrom(ATT_I2C_ADDR, 1);
   // wait a bit
   delay(1);
-  if (Wire.available() >= 1) {
-    *value = Wire.read();
+  if (i2c->available() >= 1) {
+    *value = i2c->read();
     return true;
   } else {
     // device is not present
@@ -317,27 +352,34 @@ void state_rtc_i2c_fail() {
   set_sm_state(StateMachineState::enable_can_tx);
 }
 
+elapsedMillis waiting_for_can_rx = 0;
+
 void state_enable_can_tx() {
   can_tx_enabled = true;
-  set_wait_duration(1000);
+  waiting_for_can_rx = 0;
   set_sm_state(StateMachineState::test_can_rx);
 }
 
 void state_test_can_rx() {
   if (wind_speed == 42) {
     set_sm_state(StateMachineState::can_rx_ok);
-  } else {
+    return;
+  }
+  
+  if (waiting_for_can_rx > 5000) {
     set_sm_state(StateMachineState::can_rx_fail);
   }
 }
 
 void state_can_rx_ok() {
   // TODO: report result
+  Serial.println("Got CAN rx");
   set_sm_state(StateMachineState::report_test_result);
 }
 
 void state_can_rx_fail() {
   // TODO: report result
+  Serial.println("CAN rx failed");
   set_sm_state(StateMachineState::report_test_result);
 }
 
@@ -347,13 +389,16 @@ void state_report_test_result() {
 }
 
 void state_END() {
-  set_sm_state(StateMachineState::START);
+  // wait until DUT is removed
 }
 
 std::function<void()> state_function[] = {
+  state_NONE,
   state_START,
-  state_wait_for_dut_present,
+  state_wait_for_dut,
   state_dut_present,
+  state_wait_for_flasher,
+  state_flasher_active,
   state_wait_flash_ok,
   state_flash_ok,
   state_flash_timeout,
@@ -379,9 +424,12 @@ std::function<void()> state_function[] = {
 };
 
 String state_name[] = {
+  "NONE",
   "START",
-  "wait_for_dut_present",
+  "wait_for_dut",
   "dut_present",
+  "wait_for_flasher",
+  "flasher_active",
   "wait_flash_ok",
   "flash_ok",
   "flash_timeout",
@@ -407,6 +455,8 @@ String state_name[] = {
 };
 
 void print_state(StateMachineState state) {
+  display->begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display->setRotation(2);
   display->clearDisplay();
   display->setTextSize(1);
   display->setCursor(0, 0);
@@ -414,6 +464,9 @@ void print_state(StateMachineState state) {
   display->printf("Uptime: %lu\n", micros() / 1000000);
   display->printf("%s\n", state_name[(int)state].c_str());
   display->display();
+
+  Serial.printf("State: %s\n", state_name[(int)state].c_str());
+  delay(5);
 }
 
 void handle_state_machine() {
@@ -424,12 +477,15 @@ void handle_state_machine() {
   bool dut_present = !digitalRead(DUT_PRESENT_PIN);
   if (!dut_present && state_machine_state >= StateMachineState::dut_present) {
     // unexpected removal of DUT
-    state_machine_state = StateMachineState::START;
+    Serial.println("DUT removed; returning to START");
+    set_sm_state(StateMachineState::START);
   }
 
   if (prev_state != state_machine_state) {
     print_state(state_machine_state);
   }
+
+  prev_state = state_machine_state;
 
   state_function[(int)state_machine_state]();
 }
@@ -439,8 +495,8 @@ void handle_nmea2000_messages(const tN2kMsg& message) {
   double speed;
   double angle;
   tN2kWindReference reference;
-  double actual;
-  double setpoint_temperature;
+
+  Serial.printf("Received PGN: %ld\n", message.PGN);
 
   if (message.PGN == 130306) {
     if (ParseN2kWindSpeed(message, SID, speed, angle, reference)) {
@@ -465,6 +521,8 @@ ReactESP app([]() {
   Serial.begin(115200);
   delay(100);
 
+  Serial.println("Started.");
+
   // toggle the LED pin at rate of 2 Hz
   pinMode(LED_BUILTIN, OUTPUT);
   app.onRepeatMicros(1e6 / 2, []() {
@@ -484,9 +542,30 @@ ReactESP app([]() {
   ads1115->begin();
   ads1115->setGain(GAIN_ONE);
 
+  // initialize the display
+  i2c = new TwoWire(0);
+  i2c->begin(SDA_PIN, SCL_PIN);
+  display = new Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, i2c, -1);
+  if (!display->begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+  }
+  delay(100);
+  display->setRotation(2);
+  display->clearDisplay();
+  display->display();
+
   // set up the state machine
   app.onRepeat(1, []() {
     handle_state_machine();
+  });
+
+  app.onRepeat(800, [] {
+    if (can_tx_enabled) {
+      tN2kMsg N2kMsg;
+      Serial.println("Sending main cabin temperature");
+      SetN2kTemperatureExt(N2kMsg, 1, 1, N2kts_MainCabinTemperature, 273.15 + 24.5);
+      NMEA2000.SendMsg(N2kMsg);
+    }
   });
 
   // input the NMEA 2000 messages
@@ -520,18 +599,6 @@ ReactESP app([]() {
 
   // No need to parse the messages at every single loop iteration; 1 ms will do
   app.onRepeat(1, []() { NMEA2000.ParseMessages(); });
-
-  // initialize the display
-  i2c = new TwoWire(0);
-  i2c->begin(SDA_PIN, SCL_PIN);
-  display = new Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, i2c, -1);
-  if (!display->begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-  }
-  delay(100);
-  display->setRotation(2);
-  display->clearDisplay();
-  display->display();
 
   // enable all object that need enabling
   Enable::enable_all();
