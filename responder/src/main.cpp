@@ -1,11 +1,11 @@
 #include <Arduino.h>
 
 #define SPI_CS_PIN 15
-#define SPI_INT_PIN 27
+#define SPI_INT_PIN 5
 
 #include <SPI.h>
+#include <NMEA2000_mcp.h>
 #include <N2kMessages.h>
-#include <NMEA2000_mcp.h>  // This will automatically choose right CAN library and create suitable NMEA2000 object
 
 #include "ReactESP.h"
 
@@ -18,12 +18,15 @@ void handle_nmea2000_messages(const tN2kMsg& message) {
   double actual;
   double setpoint_temperature;
 
+  Serial.printf("Received PGN: %ld\n", message.PGN);
+
   if (message.PGN == 130316) {
     if (ParseN2kTemperatureExt(message, SID, instance, source, actual,
                                setpoint_temperature)) {
       if (source == N2kts_MainCabinTemperature) {
         Serial.println("Received PGN 130316.");
-        if (actual == 42.) {
+        Serial.printf("Actual temperature: %f\n", actual);
+        if (actual == 280.) {
           Serial.println("Responding with Wind Speed");
           // send a response
           tN2kMsg N2kMsg;
@@ -40,8 +43,10 @@ ReactESP app([]() {
   Serial.begin(115200);
   delay(100);
 
-  tNMEA2000_mcp* n2k = new tNMEA2000_mcp(SPI_CS_PIN, MCP_16MHz, SPI_INT_PIN);
-  nmea2000 = n2k;
+  tNMEA2000_mcp* nmea2000_mcp = new tNMEA2000_mcp(SPI_CS_PIN, MCP_16MHz, SPI_INT_PIN);
+
+  nmea2000 = nmea2000_mcp;
+
 
   // toggle the LED pin at the rate of 4 Hz
   pinMode(LED_BUILTIN, OUTPUT);
@@ -82,14 +87,15 @@ ReactESP app([]() {
 
   nmea2000->SetMode(tNMEA2000::N2km_NodeOnly, 22);
   nmea2000->EnableForward(false);  // Disable all msg forwarding to USB (=Serial)
+  nmea2000->SetMsgHandler(handle_nmea2000_messages);
   nmea2000->Open();
 
   // No need to parse the messages at every single loop iteration; 1 ms will do
   app.onRepeat(1, []() { nmea2000->ParseMessages(); });
 
-  app.onRepeat(100, []() {
-    tN2kMsg N2kMsg;
-    SetN2kTemperatureExt(N2kMsg, 1, 1, N2kts_MainCabinTemperature, 273.15 + 24.5);
-    nmea2000->SendMsg(N2kMsg);
-  });
+  //app.onRepeat(100, []() {
+  //  tN2kMsg N2kMsg;
+  //  SetN2kTemperatureExt(N2kMsg, 1, 1, N2kts_MainCabinTemperature, 273.15 + 24.5);
+  //  nmea2000->SendMsg(N2kMsg);
+  //});
 });
